@@ -1,0 +1,122 @@
+import os
+import numpy as np
+import mne
+from vmdpy import VMD
+from scipy.signal import butter, filtfilt, welch
+from sklearn.cross_decomposition import CCA
+import pandas as pd
+
+# --- Folder containing all EEG .bdf files ---
+eeg_folder = r"C:\Users\medin\Downloads\Migraine & altered_consciousness\Absolute_power_bdf_files"
+
+# --- Output CSV path ---
+output_csv = r"C:\Users\medin\Downloads\Migraine & altered_consciousness\Absolute_power_bdf_files\EEG_Absolute_Band_Powers_AllSubjects.csv"
+
+# --- Epoch parameters ---
+epoch_length_sec = 30
+
+# --- VMD parameters ---
+alpha, tau, K, DC, init = 1000, 0., 5, 0, 1
+
+# --- EEG bands ---
+bands = {
+    "Delta (0.5–4 Hz)": (0.5, 4),
+    "Theta (4–8 Hz)": (4, 8),
+    "Alpha (8–13 Hz)": (8, 13),
+    "Lower Beta (13–20 Hz)": (13, 20),
+    "Higher Beta (20–30 Hz)": (20, 30),
+    "Gamma (30–40 Hz)": (30, 40)
+}
+
+# --- Initialize dataframe to store results ---
+all_subjects_df = pd.DataFrame()
+
+# --- Loop through all subject folders/files ---
+for root, dirs, files in os.walk(eeg_folder):
+    for file in files:
+        if file.endswith(".bdf"):
+            file_path = os.path.join(root, file)
+            subject_id = os.path.splitext(file)[0]  # use filename as subject ID
+
+            print(f"\nProcessing subject: {subject_id}")
+
+            # --- Load EEG ---
+            raw = mne.io.read_raw_bdf(file_path, preload=True, verbose=False)
+            raw.pick_types(eeg=True)
+            eeg_data = raw.get_data()
+            ch1_signal = eeg_data[0, :]
+            fs = int(raw.info['sfreq'])
+
+            # --- Band-pass filter (0.5–40 Hz) ---
+            lowcut, highcut, order = 0.5, 40.0, 4
+            nyquist = 0.5 * fs
+            b, a = butter(order, [lowcut / nyquist, highcut / nyquist], btype="band")
+            filtered_signal = filtfilt(b, a, ch1_signal)
+
+            # --- Epoch parameters ---
+            epoch_samples = int(epoch_length_sec * fs)
+            total_samples = len(filtered_signal)
+            n_epochs = total_samples // epoch_samples
+
+            # --- Preprocess each epoch and reconstruct full cleaned signal ---
+            cleaned_full_signal = np.array([])
+
+            for epoch_idx in range(n_epochs):
+                start = epoch_idx * epoch_samples
+                end = start + epoch_samples
+                epoch_signal = filtered_signal[start:end]
+
+                # --- Run VMD ---
+                u, u_hat, omega = VMD(epoch_signal, alpha, tau, K, DC, init, tol=1e-7)
+
+                # --- CCA mode selection ---
+                vmd_matrix = np.array(u)
+                cca_results = []
+                for i in range(K):
+                    X = vmd_matrix[i, :].reshape(-1, 1)
+                    Y = np.sum(vmd_matrix[np.arange(K) != i, :], axis=0).reshape(-1, 1)
+                    cca = CCA(n_components=1)
+                    cca.fit(X, Y)
+                    X_c, Y_c = cca.transform(X, Y)
+                    corr = np.corrcoef(X_c.T, Y_c.T)[0, 1]
+                    cca_results.append(corr)
+
+                signal_modes_idx = [i for i, corr in enumerate(cca_results) if corr > 0.6]
+                if not signal_modes_idx:
+                    continue  # skip epoch if no high-correlation modes
+
+                clean_epoch = np.sum(u[signal_modes_idx, :], axis=0)
+                cleaned_full_signal = np.concatenate((cleaned_full_signal, clean_epoch))
+
+            # --- Check if any cleaned signal exists ---
+            if len(cleaned_full_signal) == 0:
+                print(f"No clean epochs found for {subject_id}, skipping.")
+                continue
+
+            # --- Compute PSD ---
+            freqs, psd = welch(cleaned_full_signal, fs=fs, nperseg=fs*4)
+
+            # --- Compute absolute band powers ---
+            band_powers = {}
+            for band, (low, high) in bands.items():
+                mask = (freqs >= low) & (freqs <= high)
+                if np.any(mask):
+                    delta_f = freqs[1] - freqs[0]
+                    band_powers[band] = np.sum(psd[mask] * delta_f)
+                else:
+                    band_powers[band] = np.nan
+
+            # --- Add subject ID ---
+            band_powers['Subject'] = subject_id
+
+            # --- Append to results dataframe ---
+            all_subjects_df = pd.concat([all_subjects_df, pd.DataFrame([band_powers])], ignore_index=True)
+            print(f"Subject {subject_id} processed successfully.")
+
+# --- Reorder columns to have Subject first ---
+cols = ['Subject'] + [b for b in bands.keys()]
+all_subjects_df = all_subjects_df[cols]
+
+# --- Save to CSV ---
+all_subjects_df.to_csv(output_csv, index=False)
+print(f"\nAll subjects’ absolute band powers saved to: {output_csv}")
