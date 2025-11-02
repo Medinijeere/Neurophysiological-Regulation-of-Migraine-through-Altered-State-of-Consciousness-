@@ -1,0 +1,127 @@
+import os
+import numpy as np
+import scipy.io as sio
+from scipy.signal import butter, filtfilt, welch
+import mne
+from mne.preprocessing import ICA
+import pandas as pd
+
+# --- Folder containing all .mat files ---
+mat_folder = r"C:\Users\medin\Downloads\Migraine & altered_consciousness"
+
+# --- Output folder for CSVs ---
+output_folder = os.path.join(mat_folder, "absolute_power_results")
+os.makedirs(output_folder, exist_ok=True)
+
+# --- Bandpass filter settings ---
+lowcut = 1.5
+highcut = 40.0
+order = 4
+fs = 128  # sampling frequency
+
+# --- EEG frequency bands ---
+bands = {
+    'Delta (0.5–4 Hz)': (0.5, 4),
+    'Theta (4–8 Hz)': (4, 8),
+    'Alpha (8–13 Hz)': (8, 13),
+    'Lower Beta (13–20 Hz)': (13, 20),
+    'Higher Beta (20–30 Hz)': (20, 30),
+    'Gamma (30–40 Hz)': (30, 40)
+}
+
+# --- ICA components to exclude per subject ---
+exclude_dict = {
+    "54948209_during_subject_4": [7,10,12,15,17],
+    "54948218_during_subject_6": [0,7,8,11,29,27],
+    "54948227_during_subject_7": [13,4],
+    "54948242_during_subject_9": [15],
+    "54948185_during_subject_1": [5,10,17],
+    "54948191_during_subject_10": [0,8,9,17,3,4,6,16],
+    "54948197_during_subject_2": [0,1,11,3],
+    "54948203_during_subject_3": [5,4,6,13]
+    # Add all your subjects here
+}
+
+# --- Loop through all .mat files ---
+for root, dirs, files in os.walk(mat_folder):
+    for file in files:
+        if not file.endswith(".mat") or file.startswith("._"):
+            continue  # skip hidden/macOS files
+
+        file_path = os.path.join(root, file)
+        subject_name = os.path.splitext(file)[0]
+
+        # --- Only process subjects listed in exclude_dict ---
+        if subject_name not in exclude_dict:
+            print(f"Skipping {subject_name}: ICA components not specified.")
+            continue
+
+        print(f"\nProcessing subject: {subject_name}")
+
+        # --- Load .mat file safely ---
+        try:
+            mat_data = sio.loadmat(file_path)
+        except Exception as e:
+            print(f"Skipping {file}: cannot read MATLAB file ({e})")
+            continue
+
+        if 'clipped_data' not in mat_data:
+            print(f"Skipping {file}: 'clipped_data' not found.")
+            continue
+
+        eeg_data = np.array(mat_data['clipped_data'], dtype=float)
+
+        # Ensure shape channels x samples
+        if eeg_data.shape[0] < eeg_data.shape[1]:
+            eeg_data = eeg_data
+        else:
+            eeg_data = eeg_data.T
+
+        n_channels, n_samples = eeg_data.shape
+
+        # --- Bandpass filter ---
+        nyquist = 0.5 * fs
+        b, a = butter(order, [lowcut/nyquist, highcut/nyquist], btype='band')
+        filtered_data = filtfilt(b, a, eeg_data, axis=1)
+
+        # --- MNE Raw object ---
+        ch_names = [f'EEG{i+1}' for i in range(n_channels)]
+        info = mne.create_info(ch_names=ch_names, sfreq=fs, ch_types=['eeg']*n_channels)
+        raw = mne.io.RawArray(filtered_data, info)
+
+        # --- High-pass filter for ICA ---
+        raw.filter(l_freq=1., h_freq=None, verbose=False)
+
+        # --- Fit ICA ---
+        ica = ICA(n_components=n_channels, random_state=42, max_iter=1000)
+        ica.fit(raw)
+
+        # --- Exclude subject-specific ICA components ---
+        ica.exclude = exclude_dict.get(subject_name, [])
+        if ica.exclude:
+            print(f"Excluding ICA components: {ica.exclude}")
+
+        # --- Apply ICA ---
+        reconstructed_raw = ica.apply(raw.copy())
+
+        # --- Combine all channels ---
+        combined_signal = np.sum(reconstructed_raw.get_data(), axis=0)
+
+        # --- Compute PSD ---
+        freqs, psd = welch(combined_signal, fs=fs, nperseg=fs*4)
+        delta_f = freqs[1] - freqs[0]  # frequency resolution
+
+        # --- Compute absolute band powers ---
+        band_results = []
+        for band_name, (low_f, high_f) in bands.items():
+            mask = (freqs >= low_f) & (freqs < high_f)
+            abs_power = np.sum(psd[mask] * delta_f) if np.any(mask) else np.nan
+            band_results.append([band_name, abs_power])
+
+        df_bands = pd.DataFrame(band_results, columns=['Frequency Band', 'Absolute Power (V²/Hz)'])
+        df_bands.set_index('Frequency Band', inplace=True)
+
+        # --- Save CSV ---
+        csv_path = os.path.join(output_folder, f"{subject_name}_absolute_power.csv")
+        df_bands.to_csv(csv_path)
+        print(f"Saved absolute band power CSV: {csv_path}")
