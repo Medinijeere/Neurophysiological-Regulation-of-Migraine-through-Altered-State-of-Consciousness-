@@ -1,0 +1,100 @@
+import os
+import numpy as np
+import scipy.io as sio
+from scipy.signal import butter, filtfilt, welch, spectrogram
+import mne
+from mne.preprocessing import ICA
+import matplotlib.pyplot as plt
+
+# --- File path ---
+file_path = r"C:\Users\medin\Downloads\Migraine & altered_consciousness\29189792 (1)\Raw eeg\during\54948212_during_subject_5.mat"
+
+# --- Bandpass filter setup ---
+lowcut = 0.5
+highcut = 40.0
+order = 4
+fs = 128  # sampling rate
+
+# --- Load .mat data ---
+mat_data = sio.loadmat(file_path)
+if 'clipped_data' not in mat_data:
+    raise ValueError("No 'clipped_data' found in the .mat file.")
+eeg_data = np.array(mat_data['clipped_data'], dtype=float)
+
+# Ensure shape (channels x samples)
+if eeg_data.shape[0] < eeg_data.shape[1]:
+    eeg_data = eeg_data
+else:
+    eeg_data = eeg_data.T
+
+n_channels, n_samples = eeg_data.shape
+
+# --- Bandpass filter ---
+nyquist = 0.5 * fs
+b, a = butter(order, [lowcut/nyquist, highcut/nyquist], btype='band')
+filtered_data = filtfilt(b, a, eeg_data, axis=1)
+
+# --- Create MNE Raw object ---
+ch_names = [f'EEG{i+1}' for i in range(n_channels)]
+info = mne.create_info(ch_names=ch_names, sfreq=fs, ch_types=['eeg']*n_channels)
+raw = mne.io.RawArray(filtered_data, info)
+
+# --- High-pass filter for ICA performance ---
+raw.filter(l_freq=1., h_freq=None)
+
+# --- Fit ICA ---
+ica = ICA(n_components=n_channels, random_state=42, max_iter=1000)
+ica.fit(raw)
+
+# --- Plot ICA components as time series (no topomap) ---
+ica.plot_sources(raw, show=True)
+
+# --- Manually select components to remove ---
+# Replace with your chosen components after inspecting the plot
+exclude_components = [#select manually]
+ica.exclude = exclude_components
+
+# --- Reconstruct signal after ICA removal ---
+reconstructed_raw = ica.apply(raw.copy())
+
+# --- Extract first channel for analysis ---
+reconstructed_data = reconstructed_raw.get_data()
+reconstructed_ch1 = reconstructed_data[0, :]
+time_axis = np.arange(reconstructed_ch1.size) / fs
+
+# --- Plot reconstructed time series ---
+plt.figure(figsize=(12,3))
+plt.plot(time_axis, reconstructed_ch1, color='green')
+plt.title("Reconstructed Signal (after ICA removal)")
+plt.xlabel("Time (s)")
+plt.ylabel("Amplitude (µV)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# --- Plot PSD (0.5 - 40 Hz) ---
+freqs, psd = welch(reconstructed_ch1, fs=fs, nperseg=fs*4)
+psd_mask = (freqs >= 0.5) & (freqs <= 40)
+plt.figure(figsize=(10,4))
+plt.semilogy(freqs[psd_mask], psd[psd_mask])
+plt.title("PSD of Reconstructed Signal")
+plt.xlabel("Frequency (Hz)")
+plt.ylabel("Power Spectral Density (V^2/Hz)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# --- Plot Spectrogram (0.5 - 40 Hz) ---
+f, t, Sxx = spectrogram(reconstructed_ch1, fs=fs, nperseg=fs*4, noverlap=fs*2)
+freq_mask = (f >= 0.5) & (f <= 40)
+Sxx_db = 10 * np.log10(Sxx[freq_mask, :] + 1e-12)
+plt.figure(figsize=(12,4))
+plt.imshow(Sxx_db, aspect='auto', origin='lower',
+           extent=[time_axis[0], time_axis[-1], f[freq_mask][0], f[freq_mask][-1]],
+           cmap='plasma')
+plt.colorbar(label='Power (dB)')
+plt.title("Spectrogram of Reconstructed Signal")
+plt.xlabel("Time (s)")
+plt.ylabel("Frequency (Hz)")
+plt.tight_layout()
+plt.show()
