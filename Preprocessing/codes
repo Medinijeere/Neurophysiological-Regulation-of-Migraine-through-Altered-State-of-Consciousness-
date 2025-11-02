@@ -1,1 +1,122 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import mne
+from vmdpy import VMD  # make sure vmdpy is installed: pip install vmdpy
+from scipy.signal import butter, filtfilt, welch, spectrogram
+from sklearn.cross_decomposition import CCA
 
+# --- File path to your .bdf file ---
+file_path = r"C:\Users\medin\Downloads\Migraine & altered_consciousness\12636731\M3_2\M3_2\M3_SSAEP.bdf"
+
+# --- Load EEG data using MNE ---
+raw = mne.io.read_raw_bdf(file_path, preload=True)
+raw.pick_types(eeg=True)
+eeg_data = raw.get_data()
+
+# --- Use the first channel ---
+ch1_signal = eeg_data[0, :]
+
+# --- Sampling frequency ---
+fs = int(raw.info['sfreq'])
+print(f"Detected sampling frequency: {fs} Hz")
+
+# --- Bandpass filter (0.5-40 Hz) ---
+lowcut = 0.5
+highcut = 40.0
+order = 4
+nyquist = 0.5 * fs
+b, a = butter(order, [lowcut/nyquist, highcut/nyquist], btype='band')
+filtered_signal = filtfilt(b, a, ch1_signal)
+
+# --- Epoch parameters ---
+epoch_length_sec = 30
+epoch_samples = epoch_length_sec * fs
+total_samples = len(filtered_signal)
+n_epochs = total_samples // epoch_samples
+print(f"Total epochs of {epoch_length_sec}s: {n_epochs}")
+
+# --- VMD parameters ---
+alpha = 1000
+tau = 0.
+K = 5
+DC = 0
+init = 1
+
+# --- Adjustable spectrogram frequency range ---
+spec_low = 0.5  # lower limit in Hz
+spec_high = 40  # upper limit in Hz
+vmin_db = -122.5
+vmax_db = -115
+
+# --- Loop through epochs, apply VMD + CCA, and plot each epoch ---
+for epoch_idx in range(n_epochs):
+    start = epoch_idx * epoch_samples
+    end = start + epoch_samples
+    epoch_signal = filtered_signal[start:end]
+
+    # --- Run VMD ---
+    u, u_hat, omega = VMD(epoch_signal, alpha, tau, K, DC, init, tol=1e-7)
+
+    # --- CCA to identify meaningful modes ---
+    vmd_matrix = np.array(u)
+    cca_results = []
+    for i in range(K):
+        X = vmd_matrix[i, :].reshape(-1,1)
+        Y = np.sum(vmd_matrix[np.arange(K)!=i, :], axis=0).reshape(-1,1)
+        cca = CCA(n_components=1)
+        cca.fit(X, Y)
+        X_c, Y_c = cca.transform(X, Y)
+        corr = np.corrcoef(X_c.T, Y_c.T)[0,1]
+        cca_results.append(corr)
+
+    # --- Keep only high-correlation modes (threshold 0.6) ---
+    signal_modes_idx = [i for i, corr in enumerate(cca_results) if corr > 0.6]
+
+    # --- Skip epoch if no mode passes threshold ---
+    if len(signal_modes_idx) == 0:
+        print(f"Epoch {epoch_idx+1} skipped (no high-correlation modes)")
+        continue
+
+    clean_epoch = np.sum(u[signal_modes_idx, :], axis=0)
+
+    # --- Time axis for epoch ---
+    time_axis = np.arange(len(clean_epoch)) / fs
+
+    # --- Plot cleaned epoch ---
+    plt.figure(figsize=(12,3))
+    plt.plot(time_axis, clean_epoch, color='green', linewidth=0.8)
+    plt.title(f'Epoch {epoch_idx+1} - Cleaned EEG (30s)')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Amplitude (µV)')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # --- PSD plot (0.5-40 Hz) ---
+    freqs, psd = welch(clean_epoch, fs=fs, nperseg=fs*4)
+    freq_mask = (freqs >= spec_low) & (freqs <= spec_high)
+    plt.figure(figsize=(10,4))
+    plt.semilogy(freqs[freq_mask], psd[freq_mask])
+    plt.title(f'Epoch {epoch_idx+1} - PSD ({spec_low}-{spec_high} Hz)')
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Power Spectral Density (V^2/Hz)')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # --- Spectrogram ---
+    f, t, Sxx = spectrogram(clean_epoch, fs=fs, nperseg=fs*4, noverlap=fs*2)
+    freq_mask = (f >= spec_low) & (f <= spec_high)
+    f = f[freq_mask]
+    Sxx = Sxx[freq_mask, :]
+    Sxx_db = 10 * np.log10(Sxx + 1e-12)
+
+    plt.figure(figsize=(12,4))
+    plt.imshow(Sxx_db, aspect='auto', origin='lower', extent=[time_axis[0], time_axis[-1], f[0], f[-1]], cmap='plasma', vmin=vmin_db, vmax=vmax_db)
+    plt.colorbar(label='Power (dB)')
+    plt.title(f'Epoch {epoch_idx+1} - Spectrogram ({spec_low}-{spec_high} Hz)')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Frequency (Hz)')
+    plt.ylim(spec_low, spec_high)
+    plt.tight_layout()
+    plt.show()
